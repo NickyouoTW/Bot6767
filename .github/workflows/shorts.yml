@@ -8,6 +8,13 @@ on:
         description: 'Upload to YouTube'
         type: boolean
         default: false
+      topic:
+        description: 'Optional topic for a render-only preview'
+        type: choice
+        options:
+          - auto
+          - reservoir
+        default: auto
       episode_date:
         description: 'Optional YYYY-MM-DD to retry a specific episode'
         type: string
@@ -43,7 +50,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: episode.json
-          key: science-animation-v1-${{ steps.episode.outputs.date }}
+          key: science-scene-v2-${{ steps.episode.outputs.date }}
       - name: Install video dependencies
         run: |
           sudo apt-get update
@@ -58,6 +65,7 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_CHANNEL_ID: ${{ vars.YT_CHANNEL_ID }}
           YT_PRIVACY: ${{ vars.YT_PRIVACY }}
+          EPISODE_TOPIC: ${{ inputs.upload != true && inputs.topic || 'auto' }}
           UPLOAD: ${{ github.event_name == 'schedule' || inputs.upload == true }}
           EPISODE_DATE: ${{ steps.episode.outputs.date }}
         run: |
@@ -214,7 +222,7 @@ jobs:
               url = episode.pop("source_url", None)
               if not isinstance(url, str) or url not in articles:
                   raise ValueError("Script did not identify an eligible source article.")
-              validate_visual(episode.get("visual"))
+              validate_scene(episode.get("scene"))
               episode["sources"] = [url]
               return episode
           
@@ -239,12 +247,13 @@ jobs:
           另有兩個巢狀物件 zh-TW 和 en，每個都有 title、hook、answer、line1、line2。
           zh-TW 各欄最多 30、29、30、31、31 字；en 各欄最多 58、78、100、105、105 字元。
           兩版要使用同樣的科學解釋與資料來源。標題用問句，解釋分成兩句。
-          加 visual 陣列，放 2 到 3 個對應題目的可見物件。每項有 icon、zh-TW（最多9字）、en（最多21字）、positions（依序為開場、答案、細節的三組 [x,y] 座標，整數0到100）。
-          icon 可選 sun, planet, moon, star, comet, satellite, rover, cloud, drop, rock, particle, light。
-          只呈現資料支持的運動或關係。至少一個物件移動，彼此避免重疊，並讓動作對應旁白。若題目無法畫成動態圖解，改選適合的來源。"""
+          加 scene 陣列，畫出一張完整的科普剖面圖或場景，6 到 22 個圖層，依背景到前景排列，至少兩個 polygon 或 rect 用來畫地形、裝置、剖面、軌道背景。
+          每個圖層有 shape（polygon, line, ellipse, rect, label）、color（navy, slate, stone, sand, green, teal, blue, ice, gold, orange, white, purple）與 points（一維 x,y 座標清單，整數 0 到 100）。
+          polygon 至少三個點，line 至少兩個點，ellipse/rect 用左上和右下兩點，label 用一點並加 zh-TW（最多10字）與 en（最多24字）。
+          移動的圖層加 offsets（三段依序的 [dx,dy] 位移，整數 -55 到 55，開場、回答、補充）。至少一個非文字圖層要移動。動作必須解釋現象，例如水面升高、物體經過另一個物體、閘門開啟。固定的圖層可省略 offsets。讓主要物件夠大，標示避免重疊或超出畫面。"""
               payload = {
                   "contents": [{"parts": [{"text": prompt}]}],
-                  "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 3000},
+                  "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 5000},
               }
               for _ in range(2):
                   try:
@@ -278,7 +287,7 @@ jobs:
               key = os.environ.get("GEMINI_API_KEY", "").strip()
               language_name = "Taiwan Mandarin with Taiwan pronunciation" if language == "zh-TW" else "natural conversational English"
               voice = "Achird" if language == "zh-TW" else "Charon"
-              sentences = [script["title"], script["answer"], script["line1"], script["line2"]]
+              sentences = [script["title"] + " " + script["hook"], script["answer"], script["line1"], script["line2"]]
               prompt = (
                   f"Read only the text below in {language_name}. Speak like a curious science presenter "
                   "explaining something to one friend. Use natural phrasing, a brief pause after the opening "
@@ -321,96 +330,155 @@ jobs:
               raise ValueError(f"Gemini returned no narration for {language}.")
           
           
-          SPRITES = {"sun", "planet", "moon", "star", "comet", "satellite", "rover", "cloud", "drop", "rock", "particle", "light"}
-          
-          
-          def validate_visual(plan):
-              if not isinstance(plan, list) or not 2 <= len(plan) <= 3:
-                  raise ValueError("Animation needs two or three objects.")
-              for item in plan:
-                  if not isinstance(item, dict) or item.get("icon") not in SPRITES:
-                      raise ValueError("Unknown animation object.")
-                  for lang, limit in (("zh-TW", 9), ("en", 21)):
-                      label = item.get(lang)
-                      if not isinstance(label, str) or not label.strip() or len(label) > limit or not label.isprintable():
-                          raise ValueError("Invalid animation label.")
-                  points = item.get("positions")
-                  if not isinstance(points, list) or len(points) != 3:
-                      raise ValueError("Each object needs three positions.")
-                  for point in points:
-                      if not isinstance(point, list) or len(point) != 2 or any(type(v) is not int or not 0 <= v <= 100 for v in point):
-                          raise ValueError("Animation positions must use the 0–100 grid.")
-              if all(len({tuple(p) for p in item["positions"]}) == 1 for item in plan):
-                  raise ValueError("Animation must illustrate a real change in position.")
-          
-          
-          def draw_animation(draw, objects, language, stage, t, accent, font):
-              colors = {
-                  "sun": "#ffd07f", "planet": "#69afe6", "moon": "#bbc7d4",
-                  "star": "#ffc77c", "comet": "#c6efff", "satellite": "#86bdf0",
-                  "rover": "#eeb77c", "cloud": "#d0e5f5", "drop": "#71d7fc",
-                  "rock": "#bea097", "particle": "#dec9f8", "light": "#fff0a4",
+          def reservoir_episode():
+              return {
+                  "slug": "reservoir-outlet-gate",
+                  "category": "水",
+                  "sources": ["https://www.usbr.gov/tsc/techreferences/hydraulics_lab/pubs/PAP/PAP-0045.pdf"],
+                  "zh-TW": {"title": "水庫怎麼把水留住？", "hook": "雨水沿河道流進上游蓄水區。",
+                            "answer": "進水比放水多，水位就升高。",
+                            "line1": "閘門抬起，水沿著出水管流向下游。",
+                            "line2": "同樣的水位下，閘門開得越大，通常放出的水越多。"},
+                  "en": {"title": "How does a reservoir hold water?", "hook": "Rain drains into the upstream basin.",
+                         "answer": "When more water comes in than goes out, the reservoir level rises.",
+                         "line1": "Lift the outlet gate and water flows downstream through the conduit.",
+                         "line2": "At the same water level, opening the gate wider generally releases more water."},
               }
-              draw.rounded_rectangle((65, 355, 655, 703), radius=27, fill="#0d1728", outline="#44516d", width=2)
-              for i in range(30):
-                  x = 79 + (i * 149) % 557
-                  y = 368 + (i * 103) % 319
-                  draw.ellipse((x, y, x+2, y+2), fill="#435674")
           
-              def disk(x, y, r, color, outline=None):
-                  draw.ellipse((x-r, y-r, x+r, y+r), fill=color, outline=outline, width=2)
           
-              for index, item in enumerate(objects):
-                  icon = item["icon"]
-                  color = colors[icon]
-                  positions = item["positions"]
-                  previous, target = positions[max(0, stage-1)], positions[stage]
-                  eased = t*t*(3-2*t)
-                  def xy(point):
-                      return 130 + 460*point[0]/100, 420 + 190*point[1]/100
-                  a, b = xy(previous), xy(target)
-                  x, y = a[0]+(b[0]-a[0])*eased, a[1]+(b[1]-a[1])*eased
-                  if a != b:
-                      for trail in range(1, 13):
-                          f = eased * trail/13
-                          disk(a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, 2, "#677b9f")
-                  r = 43 if icon in {"planet", "sun"} else 30
-                  if icon in {"sun", "star", "light"}:
-                      for ray in range(12):
-                          angle = ray*math.tau/12 + t*.13
-                          draw.line((x+math.cos(angle)*(r+4), y+math.sin(angle)*(r+4),
-                                     x+math.cos(angle)*(r+14), y+math.sin(angle)*(r+14)),
-                                    fill=color, width=2)
-                      disk(x, y, r, color, "#fff6d4")
-                  elif icon in {"satellite", "rover"}:
-                      draw.rounded_rectangle((x-22,y-16,x+22,y+17), 5, fill=color, outline="#e8f2ff")
-                      if icon == "satellite":
-                          for side in (-1, 1):
-                              dx = x + side*39
-                              draw.rectangle((dx-13,y-12,dx+13,y+12), fill="#305eab", outline=color)
-                              draw.line((dx,y-12,dx,y+12), fill=color)
-                      else:
-                          disk(x-14,y+18,8,"#222c3e",color)
-                          disk(x+14,y+18,8,"#222c3e",color)
-                      draw.line((x,y-16,x+8,y-35), fill=color, width=3)
-                      disk(x+8,y-35,4,color)
-                  elif icon == "cloud":
-                      for dx, dy, radius in ((-20,0,17),(0,-12,24),(23,1,18)):
-                          disk(x+dx,y+dy,radius,color)
-                  elif icon == "drop":
-                      draw.polygon(((x,y-36),(x-25,y+6),(x+25,y+6)), fill=color)
-                      disk(x,y+7,25,color)
-                  elif icon == "comet":
-                      draw.polygon(((x-70,y+17),(x,y-19),(x+12,y+12)),fill="#537b9d")
-                      disk(x,y,20,color)
-                  elif icon == "rock":
-                      draw.polygon(((x-27,y+14),(x-30,y-8),(x-14,y-25),(x+11,y-23),(x+30,y-7),(x+22,y+20)),fill=color)
+          def reservoir_scene(language, stage, t, font):
+              if stage == 2:
+                  stage, t = (2, t*2) if t < .5 else (3, (t-.5)*2)
+              seconds = t*6
+              mint, blue, pale = "#a8f6ce", "#51dbeb", "#e8f7f0"
+              img = Image.new("RGB", (720, 900), "#183237")
+              d = ImageDraw.Draw(img)
+              def txt(draw, x, y, text, size, color, anchor="lm"):
+                  draw.text((x, y), text, font=font(size), fill=color, anchor=anchor)
+              def ease(value):
+                  return value*value*(3-2*value)
+              def arrow(draw, x, y, color):
+                  draw.line((x-13,y,x+11,y), fill=color, width=3)
+                  draw.line((x+5,y-6,x+11,y,x+5,y+6), fill=color, width=3)
+              d.rounded_rectangle((42,286,678,864),28,fill="#183237",outline="#47615d",width=2)
+              d.polygon([(44,533),(120,463),(203,558),(277,493),(374,602),(475,530),(571,498),(676,584),(676,809),(44,809)],fill="#36524e")
+              d.polygon([(45,625),(112,553),(205,633),(310,662),(440,669),(557,620),(675,570),(675,811),(45,811)],fill="#4e6953")
+              ground=[(44,685),(128,633),(235,695),(339,722),(474,738),(581,754),(675,740),(675,816),(44,816)]
+              d.polygon(ground,fill="#796552")
+              d.line([(47,790),(173,772),(286,785),(417,789),(672,774)],fill="#9b8065",width=2)
+              level=633-40*ease(t) if stage==0 else 593-81*ease(t) if stage==1 else 512
+              # The reservoir is clipped by the upstream bank and dam.
+              start=128+(205-128)*(633-level)/(-160) if level>=585 else 72
+              start=max(56,min(126,start))
+              basin=[(start,level),(411,level),(429,736),(339,722),(235,695),(128,633)]
+              d.polygon(basin,fill="#276d80")
+              d.line((start,level,411,level),fill=blue,width=3)
+              for i in range(6):
+                  x=start+12+(i*47+seconds*27)%(392-start)
+                  yy=level+14+(i%3)*9
+                  d.line((x,yy,min(404,x+26),yy),fill="#3da9b3",width=2)
+              # Dam cross-section with the outlet conduit visible through the base.
+              d.polygon([(406,474),(459,474),(507,750),(409,750)],fill="#bcae98",outline="#eadcc4",width=2)
+              d.polygon([(432,476),(459,476),(505,748),(463,748)],fill="#968c7d")
+              for y in range(505,730,31):
+                  d.line((412,y, min(503,460+(y-474)*.15),y),fill="#a49a88",width=2)
+              d.line((387,698,507,698,555,744),fill="#242b31",width=26,joint="curve")
+              d.line((387,698,507,698,555,744),fill="#6b7471",width=2,joint="curve")
+              opening=0 if stage<2 else (22*ease(t) if stage==2 else 22+14*ease(t))
+              d.line((443,624,443,696-opening),fill="#4c463c",width=5)
+              d.rounded_rectangle((433,686-opening,452,711-opening),4,fill="#f3bc75",outline="#fff0bc",width=2)
+              if opening>1:
+                  thickness=max(2,round(opening*.55))
+                  d.line((390,700,505,700,556,746,674,755),fill="#2f99b5",width=thickness,joint="curve")
+                  for j in range(6):
+                      f=(seconds*.82+j/6)%1
+                      x=393+f*277
+                      yy=700 if x<507 else 700+min(46,(x-507)*.94) if x<556 else 746+(x-556)*.075
+                      arrow(d,x,yy,blue)
+              elif stage==0:
+                  for j in range(7):
+                      x=80+(j*42+seconds*21)%298
+                      arrow(d,x,level+5,blue)
+              if stage<2:
+                  for j in range(17 if stage==0 else 9):
+                      x=62+(j*53)%310
+                      y=343+(j*29+seconds*155)%132
+                      d.line((x,y,x-7,y+15),fill="#67c2ce",width=2)
+              if stage==1:
+                  d.line((360,517,360,633),fill="#c8eddf",width=2)
+                  for y in range(517,634,22):
+                      d.line((351,y,361,y),fill="#c8eddf",width=2)
+                  d.ellipse((353,level-7,367,level+7),fill=blue)
+                  txt(d,344,471,"水位" if language=="zh-TW" else "Water level",24,mint,"rm")
+                  d.line((347,473,360,473,360,507),fill=mint,width=2)
+              if stage>=2:
+                  d.line((443,636,505,598,559,598),fill=mint,width=2)
+                  txt(d,561,598,"出水閘" if language=="zh-TW" else "Outlet gate",24,mint)
+              txt(d,70,803,"上游蓄水區" if language=="zh-TW" else "Reservoir",24,pale)
+              txt(d,650,803,"下游河道" if language=="zh-TW" else "Downstream",24,pale,"rm")
+              return img.crop((43, 330, 677, 835)).resize((584, 414), Image.Resampling.LANCZOS)
+          
+          
+          COLORS = {
+              "navy": "#142943", "slate": "#425a72", "stone": "#9c8270", "sand": "#ddbd8f",
+              "green": "#50795e", "teal": "#318fa0", "blue": "#53b4df", "ice": "#c7edff",
+              "gold": "#f4bb67", "orange": "#df805a", "white": "#eaf3f2", "purple": "#a991e3",
+          }
+          
+          
+          def validate_scene(scene):
+              if not isinstance(scene, list) or not 6 <= len(scene) <= 22:
+                  raise ValueError("The diagram needs 6–22 layered objects.")
+              if any(not isinstance(e, dict) for e in scene):
+                  raise ValueError("Invalid diagram layer.")
+              moving = False
+              for layer in scene:
+                  shape = layer.get("shape")
+                  points = layer.get("points")
+                  valid = isinstance(points, list) and all(type(v) is int and 0 <= v <= 100 for v in points)
+                  if shape not in ("polygon", "line", "ellipse", "rect", "label") or not valid:
+                      raise ValueError("Invalid diagram shape or coordinates.")
+                  if shape in ("ellipse", "rect") and (len(points) != 4 or points[0] >= points[2] or points[1] >= points[3]):
+                      raise ValueError("Invalid diagram bounds.")
+                  if shape in ("polygon", "line") and (len(points) % 2 or not (6 if shape == "polygon" else 4) <= len(points) <= 24):
+                      raise ValueError("Invalid polygon or line.")
+                  if shape == "label":
+                      if len(points) != 2 or any(not isinstance(layer.get(lang), str) or not layer[lang].isprintable() or not 1 <= len(layer[lang]) <= limit for lang,limit in (("zh-TW",10),("en",24))):
+                          raise ValueError("Invalid diagram label.")
+                  if layer.get("color") not in COLORS:
+                      raise ValueError("Invalid diagram palette color.")
+                  offsets = layer.get("offsets", [[0,0],[0,0],[0,0]])
+                  if not isinstance(offsets,list) or len(offsets)!=3 or any(not isinstance(p,list) or len(p)!=2 or any(type(v) is not int or not -55<=v<=55 for v in p) for p in offsets):
+                      raise ValueError("Invalid diagram keyframes.")
+                  if shape != "label" and len({tuple(p) for p in offsets}) > 1:
+                      moving = True
+              if not moving or sum(layer["shape"] in ("polygon","rect") for layer in scene) < 2:
+                  raise ValueError("The scene needs a background and a moving illustration.")
+          
+          
+          def full_scene(layers, language, stage, t, font):
+              image = Image.new("RGB", (584, 414), "#101f32")
+              draw = ImageDraw.Draw(image)
+              t = t*t*(3-2*t)
+              for layer in layers:
+                  shape = layer["shape"]
+                  coordinates = layer["points"]
+                  offsets = layer.get("offsets", [[0,0],[0,0],[0,0]])
+                  start, end = offsets[max(0,stage-1)], offsets[stage]
+                  dx, dy = (start[i]+(end[i]-start[i])*t for i in range(2))
+                  points = [(16+(x+dx)*5.52, 13+(y+dy)*3.88) for x,y in zip(coordinates[::2],coordinates[1::2])]
+                  color = COLORS[layer["color"]]
+                  if shape == "polygon":
+                      draw.polygon(points, fill=color)
+                  elif shape == "ellipse":
+                      draw.ellipse(points, fill=color)
+                  elif shape == "rect":
+                      draw.rounded_rectangle(points, radius=4, fill=color)
+                  elif shape == "line":
+                      draw.line(points, fill=color, width=4, joint="curve")
                   else:
-                      disk(x,y,r,color,"#e4edff")
-                      if icon in {"moon", "planet"}:
-                          for dx,dy,rr in ((-11,-8,9),(12,8,7),(-5,14,5)):
-                              disk(x+dx,y+dy,rr,"#6f829d" if icon=="moon" else "#86d7ac")
-                  draw.text((x, y+53), item[language], font=font(21), fill=accent, anchor="mm")
+                      draw.text(points[0], layer[language], font=font(20), fill=color, anchor="mm")
+              return image
           
           
           def render(episode, language, video):
@@ -457,7 +525,10 @@ jobs:
                   draw.rounded_rectangle((46, 95, 674, 1140), radius=36, fill=panel)
                   center(165, f"{brand}  ／  {display_category}", 29, accent)
                   center(276, title, 53)
-                  draw_animation(draw, episode["visual"], language, stage, t, accent, font)
+                  scene = (reservoir_scene(language, stage, t, font)
+                           if episode["slug"] == "reservoir-outlet-gate"
+                           else full_scene(episode["scene"], language, stage, t, font))
+                  img.paste(scene, (68, 320))
                   if stage == 0:
                       center(785, hook, 38)
                   else:
@@ -551,7 +622,10 @@ jobs:
               else:
                   if args.upload and len(pending) != len(LANGUAGES):
                       raise SystemExit("Original bilingual script unavailable. Find episode.json from the original run.")
-                  episode = generate_episode(day, history, seen)
+                  if os.getenv("EPISODE_TOPIC") == "reservoir" or (args.upload and "Science Notes / episode / reservoir-outlet-gate" not in seen):
+                      episode = reservoir_episode()
+                  else:
+                      episode = generate_episode(day, history, seen)
                   SCRIPT.write_text(json.dumps(episode, ensure_ascii=False, indent=2), encoding="utf-8")
               privacy = os.getenv("YT_PRIVACY", "").strip() or "private"
               if privacy not in {"private", "unlisted", "public"}:
@@ -588,7 +662,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: episode.json
-          key: science-animation-v1-${{ steps.episode.outputs.date }}
+          key: science-scene-v2-${{ steps.episode.outputs.date }}
       - name: Upload both language versions
         if: (github.event_name == 'schedule' || inputs.upload == true) && hashFiles('output/short-*.mp4') != ''
         env:
