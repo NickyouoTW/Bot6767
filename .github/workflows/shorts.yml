@@ -215,7 +215,7 @@ jobs:
           
           
           def generate_episode(day, history, seen):
-              key = os.environ.get("GEMINI_API_KEY")
+              key = os.environ.get("GEMINI_API_KEY", "").strip()
               if not key:
                   raise SystemExit("Add GEMINI_API_KEY to GitHub Actions Secrets.")
               articles = science_sources(history)
