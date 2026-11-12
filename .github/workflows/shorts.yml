@@ -43,7 +43,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: episode.json
-          key: science-bilingual-v1-${{ steps.episode.outputs.date }}
+          key: science-animation-v1-${{ steps.episode.outputs.date }}
       - name: Install video dependencies
         run: |
           sudo apt-get update
@@ -66,6 +66,8 @@ jobs:
           import base64
           import wave
           import html
+          import math
+          from functools import lru_cache
           import xml.etree.ElementTree as ET
           import datetime as dt
           import json
@@ -212,6 +214,7 @@ jobs:
               url = episode.pop("source_url", None)
               if not isinstance(url, str) or url not in articles:
                   raise ValueError("Script did not identify an eligible source article.")
+              validate_visual(episode.get("visual"))
               episode["sources"] = [url]
               return episode
           
@@ -235,7 +238,10 @@ jobs:
           欄位：slug（最多 56 字元的英文連字號題目 ID）、category（大氣、水、太空、生物、物理、地球之一）。
           另有兩個巢狀物件 zh-TW 和 en，每個都有 title、hook、answer、line1、line2。
           zh-TW 各欄最多 30、29、30、31、31 字；en 各欄最多 58、78、100、105、105 字元。
-          兩版要使用同樣的科學解釋與資料來源。標題用問句，解釋分成兩句。"""
+          兩版要使用同樣的科學解釋與資料來源。標題用問句，解釋分成兩句。
+          加 visual 陣列，放 2 到 3 個對應題目的可見物件。每項有 icon、zh-TW（最多9字）、en（最多21字）、positions（依序為開場、答案、細節的三組 [x,y] 座標，整數0到100）。
+          icon 可選 sun, planet, moon, star, comet, satellite, rover, cloud, drop, rock, particle, light。
+          只呈現資料支持的運動或關係。至少一個物件移動，彼此避免重疊，並讓動作對應旁白。若題目無法畫成動態圖解，改選適合的來源。"""
               payload = {
                   "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 3000},
@@ -315,6 +321,98 @@ jobs:
               raise ValueError(f"Gemini returned no narration for {language}.")
           
           
+          SPRITES = {"sun", "planet", "moon", "star", "comet", "satellite", "rover", "cloud", "drop", "rock", "particle", "light"}
+          
+          
+          def validate_visual(plan):
+              if not isinstance(plan, list) or not 2 <= len(plan) <= 3:
+                  raise ValueError("Animation needs two or three objects.")
+              for item in plan:
+                  if not isinstance(item, dict) or item.get("icon") not in SPRITES:
+                      raise ValueError("Unknown animation object.")
+                  for lang, limit in (("zh-TW", 9), ("en", 21)):
+                      label = item.get(lang)
+                      if not isinstance(label, str) or not label.strip() or len(label) > limit or not label.isprintable():
+                          raise ValueError("Invalid animation label.")
+                  points = item.get("positions")
+                  if not isinstance(points, list) or len(points) != 3:
+                      raise ValueError("Each object needs three positions.")
+                  for point in points:
+                      if not isinstance(point, list) or len(point) != 2 or any(type(v) is not int or not 0 <= v <= 100 for v in point):
+                          raise ValueError("Animation positions must use the 0–100 grid.")
+              if all(len({tuple(p) for p in item["positions"]}) == 1 for item in plan):
+                  raise ValueError("Animation must illustrate a real change in position.")
+          
+          
+          def draw_animation(draw, objects, language, stage, t, accent, font):
+              colors = {
+                  "sun": "#ffd07f", "planet": "#69afe6", "moon": "#bbc7d4",
+                  "star": "#ffc77c", "comet": "#c6efff", "satellite": "#86bdf0",
+                  "rover": "#eeb77c", "cloud": "#d0e5f5", "drop": "#71d7fc",
+                  "rock": "#bea097", "particle": "#dec9f8", "light": "#fff0a4",
+              }
+              draw.rounded_rectangle((65, 355, 655, 703), radius=27, fill="#0d1728", outline="#44516d", width=2)
+              for i in range(30):
+                  x = 79 + (i * 149) % 557
+                  y = 368 + (i * 103) % 319
+                  draw.ellipse((x, y, x+2, y+2), fill="#435674")
+          
+              def disk(x, y, r, color, outline=None):
+                  draw.ellipse((x-r, y-r, x+r, y+r), fill=color, outline=outline, width=2)
+          
+              for index, item in enumerate(objects):
+                  icon = item["icon"]
+                  color = colors[icon]
+                  positions = item["positions"]
+                  previous, target = positions[max(0, stage-1)], positions[stage]
+                  eased = t*t*(3-2*t)
+                  def xy(point):
+                      return 130 + 460*point[0]/100, 420 + 190*point[1]/100
+                  a, b = xy(previous), xy(target)
+                  x, y = a[0]+(b[0]-a[0])*eased, a[1]+(b[1]-a[1])*eased
+                  if a != b:
+                      for trail in range(1, 13):
+                          f = eased * trail/13
+                          disk(a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, 2, "#677b9f")
+                  r = 43 if icon in {"planet", "sun"} else 30
+                  if icon in {"sun", "star", "light"}:
+                      for ray in range(12):
+                          angle = ray*math.tau/12 + t*.13
+                          draw.line((x+math.cos(angle)*(r+4), y+math.sin(angle)*(r+4),
+                                     x+math.cos(angle)*(r+14), y+math.sin(angle)*(r+14)),
+                                    fill=color, width=2)
+                      disk(x, y, r, color, "#fff6d4")
+                  elif icon in {"satellite", "rover"}:
+                      draw.rounded_rectangle((x-22,y-16,x+22,y+17), 5, fill=color, outline="#e8f2ff")
+                      if icon == "satellite":
+                          for side in (-1, 1):
+                              dx = x + side*39
+                              draw.rectangle((dx-13,y-12,dx+13,y+12), fill="#305eab", outline=color)
+                              draw.line((dx,y-12,dx,y+12), fill=color)
+                      else:
+                          disk(x-14,y+18,8,"#222c3e",color)
+                          disk(x+14,y+18,8,"#222c3e",color)
+                      draw.line((x,y-16,x+8,y-35), fill=color, width=3)
+                      disk(x+8,y-35,4,color)
+                  elif icon == "cloud":
+                      for dx, dy, radius in ((-20,0,17),(0,-12,24),(23,1,18)):
+                          disk(x+dx,y+dy,radius,color)
+                  elif icon == "drop":
+                      draw.polygon(((x,y-36),(x-25,y+6),(x+25,y+6)), fill=color)
+                      disk(x,y+7,25,color)
+                  elif icon == "comet":
+                      draw.polygon(((x-70,y+17),(x,y-19),(x+12,y+12)),fill="#537b9d")
+                      disk(x,y,20,color)
+                  elif icon == "rock":
+                      draw.polygon(((x-27,y+14),(x-30,y-8),(x-14,y-25),(x+11,y-23),(x+30,y-7),(x+22,y+20)),fill=color)
+                  else:
+                      disk(x,y,r,color,"#e4edff")
+                      if icon in {"moon", "planet"}:
+                          for dx,dy,rr in ((-11,-8,9),(12,8,7),(-5,14,5)):
+                              disk(x+dx,y+dy,rr,"#6f829d" if icon=="moon" else "#86d7ac")
+                  draw.text((x, y+53), item[language], font=font(21), fill=accent, anchor="mm")
+          
+          
           def render(episode, language, video):
               category = episode["category"]
               script = episode[language]
@@ -332,10 +430,11 @@ jobs:
               }
               background, panel, accent = palettes[category]
           
+              @lru_cache(maxsize=128)
               def font(size):
                   return ImageFont.truetype(FONT_PATH, size, index=3)
           
-              def card(stage):
+              def card(stage, t):
                   img = Image.new("RGB", (WIDTH, HEIGHT), background)
                   draw = ImageDraw.Draw(img)
           
@@ -358,19 +457,7 @@ jobs:
                   draw.rounded_rectangle((46, 95, 674, 1140), radius=36, fill=panel)
                   center(165, f"{brand}  ／  {display_category}", 29, accent)
                   center(276, title, 53)
-                  draw.ellipse((232, 374, 488, 630), outline=accent, width=3)
-                  if category == "大氣":
-                      for i in range(4):
-                          draw.arc((261-i*12, 422-i*11, 459+i*12, 605+i*11), 205, 332, fill=accent, width=4)
-                  elif category == "水":
-                      draw.polygon([(360, 420), (301, 512), (419, 512)], fill=accent)
-                      draw.ellipse((301, 472, 419, 583), fill=accent)
-                  elif category == "太空":
-                      draw.ellipse((298, 438, 421, 563), fill=accent)
-                      draw.ellipse((330, 412, 445, 534), fill=panel)
-                  else:
-                      for i in range(4):
-                          draw.arc((278+i*13, 418+i*15, 442-i*13, 598-i*7), 187, 353, fill=accent, width=4)
+                  draw_animation(draw, episode["visual"], language, stage, t, accent, font)
                   if stage == 0:
                       center(785, hook, 38)
                   else:
@@ -391,21 +478,20 @@ jobs:
               first = max(24, round(frames * weights[0] / sum(weights)))
               second = max(24, round(frames * weights[1] / sum(weights)))
               counts = (first, second, frames - first - second)
-              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-              for i in range(3):
-                  file = OUT / f"card-{language}-{i}.png"
-                  card(i).save(file)
-                  cmd += ["-i", str(file)]
-              cmd += ["-i", str(audio)]
-              filters = [
-                  f"[{i}:v]zoompan=z='1+0.00018*on':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d={count}:s=720x1280:fps=24[v{i}]"
-                  for i, count in enumerate(counts)
-              ]
-              filters.append("[v0][v1][v2]concat=n=3:v=1:a=0[v]")
-              cmd += ["-filter_complex", ";".join(filters), "-map", "[v]", "-map", "3:a",
-                      "-af", "apad=pad_dur=0.5", "-shortest", "-c:v", "libx264", "-preset", "fast",
-                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", str(video)]
-              subprocess.run(cmd, check=True)
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                     "-f", "rawvideo", "-pixel_format", "rgb24", "-video_size", f"{WIDTH}x{HEIGHT}",
+                     "-framerate", "24", "-i", "-", "-i", str(audio),
+                     "-map", "0:v", "-map", "1:a", "-af", "apad=pad_dur=0.5", "-shortest",
+                     "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-movflags", "+faststart", str(video)]
+              with subprocess.Popen(cmd, stdin=subprocess.PIPE) as process:
+                  for stage, count in enumerate(counts):
+                      for frame in range(count):
+                          t = frame / max(1, count - 1)
+                          process.stdin.write(card(stage, t).tobytes())
+                  process.stdin.close()
+                  if process.wait():
+                      raise RuntimeError(f"Could not encode the {language} animation.")
           
           
           def upload(headers, meta, video):
@@ -502,7 +588,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: episode.json
-          key: science-bilingual-v1-${{ steps.episode.outputs.date }}
+          key: science-animation-v1-${{ steps.episode.outputs.date }}
       - name: Upload both language versions
         if: (github.event_name == 'schedule' || inputs.upload == true) && hashFiles('output/short-*.mp4') != ''
         env:
