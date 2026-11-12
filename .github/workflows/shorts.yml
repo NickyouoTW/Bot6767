@@ -248,7 +248,13 @@ jobs:
                   except urllib.error.HTTPError as error:
                       if error.code == 429:
                           raise SystemExit("Gemini quota or rate limit reached. This run was skipped.") from None
-                      raise SystemExit(f"Gemini API request failed (HTTP {error.code}).") from None
+                      try:
+                          detail = json.load(error).get("error", {})
+                          codes = [detail.get("status", "")] + [item.get("reason", "") for item in detail.get("details", []) if isinstance(item, dict)]
+                          reason = ", ".join(code for code in codes if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{1,90}", code))
+                      except (ValueError, AttributeError):
+                          reason = ""
+                      raise SystemExit(f"Gemini API request failed (HTTP {error.code}) {reason}") from None
                   try:
                       episode = parse_episode(response, history, articles)
                       if f"Science Notes / episode / {episode['slug']}" in seen:
