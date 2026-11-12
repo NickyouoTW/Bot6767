@@ -197,7 +197,7 @@ jobs:
                   return re.sub(r"[\W_]+", "", title.removesuffix(" #Shorts")).casefold()
           
               old_titles = {normalized(title) for title in history}
-              for language, limits in {"zh-TW": (30, 29, 30, 31, 31), "en": (58, 56, 60, 70, 70)}.items():
+              for language, limits in {"zh-TW": (30, 29, 30, 31, 31), "en": (58, 78, 100, 105, 105)}.items():
                   script = episode.get(language)
                   if not isinstance(script, dict):
                       raise ValueError(f"Missing {language} script.")
@@ -232,7 +232,7 @@ jobs:
           只輸出 JSON 物件，另外包含 source_url 欄，值必須是上面其中一篇的完整網址。
           欄位：slug（最多 56 字元的英文連字號題目 ID）、category（大氣、水、太空、生物、物理、地球之一）。
           另有兩個巢狀物件 zh-TW 和 en，每個都有 title、hook、answer、line1、line2。
-          zh-TW 各欄最多 30、29、30、31、31 字；en 各欄最多 58、56、60、70、70 字元。
+          zh-TW 各欄最多 30、29、30、31、31 字；en 各欄最多 58、78、100、105、105 字元。
           兩版要使用同樣的科學解釋與資料來源。標題用問句，解釋分成兩句。"""
               payload = {
                   "contents": [{"parts": [{"text": prompt}]}],
