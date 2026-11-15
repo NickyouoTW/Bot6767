@@ -227,13 +227,64 @@ jobs:
               return episode
           
           
-          def generate_episode(day, history, seen):
+          FORMATS = {
+              "question": "開場用一個具體好懂的問題，下一句立刻給答案。",
+              "surprise": "開場先呈現一個和直覺相反的結果，下一句解釋原因。",
+          }
+          
+          
+          def choose_formats(day, headers, seen):
+              # Explore on alternate days. Compare only public videos at least two days old.
+              baseline = ("question", "question", "surprise", "surprise")[day.toordinal() % 4]
+              chosen = dict.fromkeys(LANGUAGES, baseline)
+              markers = {}
+              for marker, video_id in seen.items():
+                  match = re.fullmatch(r"Science Notes / (\d{4}-\d{2}-\d{2}) / (zh-TW|en)", marker)
+                  if match and 2 <= (day - dt.date.fromisoformat(match[1])).days <= 60:
+                      markers[video_id] = match[2]
+              if not markers:
+                  return chosen
+              scores = {language: {style: [] for style in FORMATS} for language in LANGUAGES}
+              ids = list(markers)
+              try:
+                  for i in range(0, len(ids), 50):
+                      query = urllib.parse.urlencode({"part": "snippet,statistics,status", "id": ",".join(ids[i:i+50])})
+                      _, result = request(f"{API}/videos?{query}", headers=headers)
+                      for video in result.get("items", []):
+                          if video.get("status", {}).get("privacyStatus") != "public":
+                              continue
+                          language = markers.get(video["id"])
+                          stats = video.get("statistics", {})
+                          views = int(stats.get("viewCount", 0))
+                          if language is None or views < 30 or "likeCount" not in stats:
+                              continue
+                          lines = video["snippet"].get("description", "").splitlines()
+                          for style in FORMATS:
+                              if f"Science Notes / format / {style}" in lines:
+                                  likes = int(stats["likeCount"])
+                                  scores[language][style].append((likes + 1) / (views + 50))
+              except (OSError, ValueError, KeyError):
+                  print("YouTube statistics unavailable. Using the alternating format.")
+                  return chosen
+              for language, styles in scores.items():
+                  counts = {style: len(samples) for style, samples in styles.items()}
+                  if min(counts.values()) >= 3 and day.toordinal() % 4 in (1, 3):
+                      averages = {style: sum(samples) / len(samples) for style, samples in styles.items()}
+                      if abs(averages["question"] - averages["surprise"]) >= .005:
+                          chosen[language] = max(averages, key=averages.get)
+                  print(f"Format {language}: {chosen[language]} (eligible samples: {counts})")
+              return chosen
+          
+          
+          def generate_episode(day, history, seen, formats):
               key = os.environ.get("GEMINI_API_KEY", "").strip()
               if not key:
                   raise SystemExit("Add GEMINI_API_KEY to GitHub Actions Secrets.")
               articles = science_sources(history)
               focus = CATEGORIES[day.toordinal() % len(CATEGORIES)]
               prompt = f"""替科普 Shorts 寫同一新主題的台灣繁體中文版和自然英文版，優先主題：{focus}。
+          各語言分別採用這些開場策略：{json.dumps({lang: FORMATS[style] for lang, style in formats.items()}, ensure_ascii=False)}。
+          hook 直接說出要解釋的現象或反直覺結果，最多一短句。answer 第一句就揭曉原因。
           從下面提供的來源摘要中挑一篇，寫成能用兩句清楚解釋的科普。只使用來源明確提供的事實。
           遇到重複題目換另一個，不要寫新聞公告或猜測。
           使用台灣常用繁體中文，解釋因果，避開時事、診斷、療法、誇大說法和未定論。
@@ -287,7 +338,9 @@ jobs:
               key = os.environ.get("GEMINI_API_KEY", "").strip()
               language_name = "Taiwan Mandarin with Taiwan pronunciation" if language == "zh-TW" else "natural conversational English"
               voice = "Achird" if language == "zh-TW" else "Charon"
-              sentences = [script["title"] + " " + script["hook"], script["answer"], script["line1"], script["line2"]]
+              sentences = [script["hook"], script["answer"], script["line1"], script["line2"]]
+              if script.get("format") != "surprise":
+                  sentences[0] = script["title"] + " " + script["hook"]
               prompt = (
                   f"Read only the text below in {language_name}. Speak like a curious science presenter "
                   "explaining something to one friend. Use natural phrasing, a brief pause after the opening "
@@ -625,7 +678,9 @@ jobs:
                   if os.getenv("EPISODE_TOPIC") == "reservoir" or (args.upload and "Science Notes / episode / reservoir-outlet-gate" not in seen):
                       episode = reservoir_episode()
                   else:
-                      episode = generate_episode(day, history, seen)
+                      formats = choose_formats(day, headers, seen) if args.upload else dict.fromkeys(LANGUAGES, "question")
+                      episode = generate_episode(day, history, seen, formats)
+                      episode["formats"] = formats
                   SCRIPT.write_text(json.dumps(episode, ensure_ascii=False, indent=2), encoding="utf-8")
               privacy = os.getenv("YT_PRIVACY", "").strip() or "private"
               if privacy not in {"private", "unlisted", "public"}:
@@ -636,11 +691,15 @@ jobs:
                   brand, source_label, hashtag, _ = LANGUAGES[language]
                   title = episode[language]["title"]
                   video, metadata_file = video_paths(language)
+                  style = episode.get("formats", {}).get(language)
+                  if style:
+                      episode[language]["format"] = style
+                  format_marker = f"\nScience Notes / format / {style}" if style else ""
                   render(episode, language, video)
                   metadata = {
                       "snippet": {
                           "title": f"{title} #Shorts",
-                          "description": f"{brand}\n{source_label}\n{sources}\n\n{hashtag} #Shorts\n\n{markers[language]}\n{topic_marker}",
+                          "description": f"{brand}\n{source_label}\n{sources}\n\n{hashtag} #Shorts\n\n{markers[language]}\n{topic_marker}{format_marker}",
                           "categoryId": "27",
                           "defaultLanguage": language,
                       },
