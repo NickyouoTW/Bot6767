@@ -2,6 +2,7 @@ name: Science Shorts
 on:
   schedule:
     - cron: '17 12 * * *'
+    - cron: '47 13 * * *'
   workflow_dispatch:
     inputs:
       upload:
@@ -21,6 +22,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: science-shorts
   cancel-in-progress: false
@@ -34,13 +36,27 @@ jobs:
         id: episode
         env:
           REQUESTED_DATE: ${{ inputs.episode_date }}
+          ACTIONS_TOKEN: ${{ github.event_name == 'schedule' && github.token || '' }}
         run: |
           python3 - <<'PYTHON'
           import datetime
+          import json
           import os
+          import urllib.request
           from zoneinfo import ZoneInfo
           raw = os.environ.get("REQUESTED_DATE")
-          date = datetime.date.fromisoformat(raw) if raw else datetime.datetime.now(ZoneInfo("Asia/Taipei")).date()
+          taipei = ZoneInfo("Asia/Taipei")
+          if raw:
+              date = datetime.date.fromisoformat(raw)
+          elif os.environ["GITHUB_EVENT_NAME"] == "schedule":
+              api, repo, run_id = (os.environ[key] for key in ("GITHUB_API_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"))
+              req = urllib.request.Request(f"{api}/repos/{repo}/actions/runs/{run_id}",
+                                           headers={"Authorization": "Bearer " + os.environ["ACTIONS_TOKEN"]})
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  created = datetime.datetime.fromisoformat(json.load(response)["created_at"]).astimezone(taipei)
+              date = created.date() - datetime.timedelta(days=created.time() < datetime.time(20, 17))
+          else:
+              date = datetime.datetime.now(taipei).date()
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"date={date.isoformat()}", file=output)
           PYTHON
@@ -83,6 +99,7 @@ jobs:
           import re
           from pathlib import Path
           import subprocess
+          import time
           import urllib.parse
           import urllib.request
           from zoneinfo import ZoneInfo
@@ -108,6 +125,19 @@ jobs:
                   return response.headers, json.load(response) if response.length != 0 else {}
           
           
+          def gemini_request(url, *, data, headers):
+              for delay in (2, 5):
+                  try:
+                      return request(url, data=data, headers=headers)
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (502, 503, 504):
+                          raise
+                      print(f"Gemini returned HTTP {error.code}; retrying in {delay} seconds.")
+                      error.close()
+                  time.sleep(delay)
+              return request(url, data=data, headers=headers)
+
+
           def youtube_session():
               required = ("YT_CLIENT_ID", "YT_CLIENT_SECRET", "YT_REFRESH_TOKEN", "YT_CHANNEL_ID")
               missing = [key for key in required if not os.environ.get(key)]
@@ -308,7 +338,7 @@ jobs:
               }
               for _ in range(2):
                   try:
-                      _, response = request(
+                      _, response = gemini_request(
                           "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent",
                           data=json.dumps(payload, ensure_ascii=False).encode(),
                           headers={"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -355,7 +385,7 @@ jobs:
                   },
               }
               try:
-                  _, response = request(
+                  _, response = gemini_request(
                       "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
                       data=json.dumps(payload, ensure_ascii=False).encode(),
                       headers={"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -559,7 +589,7 @@ jobs:
                   img = Image.new("RGB", (WIDTH, HEIGHT), background)
                   draw = ImageDraw.Draw(img)
           
-                  def center(y, value, size, color="#f7f4ee"):
+                  def center(y, value, size, color="#f7f4ee", *, bottom=None):
                       words = value.split()
                       if language == "en" and len(words) > 1 and draw.textlength(value, font=font(size)) > 550:
                           def longest_line(index):
@@ -571,17 +601,22 @@ jobs:
                           parts = [value]
                       while max(draw.textlength(part, font=font(size)) for part in parts) > 550:
                           size -= 1
-                      for i, part in enumerate(parts):
-                          offset = (i - (len(parts) - 1) / 2) * size * 1.13
+                      offsets = [(i - (len(parts) - 1) / 2) * size * 1.13 for i in range(len(parts))]
+                      if bottom is not None:
+                          text_bottom = max(draw.textbbox((360, y + offset), part, font=font(size), anchor="mm")[3]
+                                            for part, offset in zip(parts, offsets))
+                          y -= max(0, text_bottom - bottom)
+                      for part, offset in zip(parts, offsets):
                           draw.text((360, y + offset), part, font=font(size), fill=color, anchor="mm")
           
                   draw.rounded_rectangle((46, 95, 674, 1140), radius=36, fill=panel)
                   center(165, f"{brand}  ／  {display_category}", 29, accent)
-                  center(276, title, 53)
+                  scene_top = 320
+                  center(276, title, 53, bottom=scene_top - 16 if language == "en" else None)
                   scene = (reservoir_scene(language, stage, t, font)
                            if episode["slug"] == "reservoir-outlet-gate"
                            else full_scene(episode["scene"], language, stage, t, font))
-                  img.paste(scene, (68, 320))
+                  img.paste(scene, (68, scene_top))
                   if stage == 0:
                       center(785, hook, 38)
                   else:
