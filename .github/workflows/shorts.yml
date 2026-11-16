@@ -1,8 +1,12 @@
 name: Science Shorts
 on:
   schedule:
+    - cron: '17 0 * * *'
+    - cron: '17 4 * * *'
+    - cron: '17 8 * * *'
     - cron: '17 12 * * *'
-    - cron: '47 13 * * *'
+    - cron: '17 16 * * *'
+    - cron: '17 20 * * *'
   workflow_dispatch:
     inputs:
       upload:
@@ -17,7 +21,10 @@ on:
           - reservoir
         default: auto
       episode_date:
-        description: 'Optional YYYY-MM-DD to retry a specific episode'
+        description: 'Optional YYYY-MM-DD for retry'
+        type: string
+      episode_hour:
+        description: 'Taipei slot hour for retry (00, 04, 08, 12, 16, 20)'
         type: string
 
 permissions:
@@ -36,6 +43,8 @@ jobs:
         id: episode
         env:
           REQUESTED_DATE: ${{ inputs.episode_date }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          REQUESTED_HOUR: ${{ inputs.episode_hour }}
           ACTIONS_TOKEN: ${{ github.event_name == 'schedule' && github.token || '' }}
         run: |
           python3 - <<'PYTHON'
@@ -46,19 +55,29 @@ jobs:
           from zoneinfo import ZoneInfo
           raw = os.environ.get("REQUESTED_DATE")
           taipei = ZoneInfo("Asia/Taipei")
-          if raw:
-              date = datetime.date.fromisoformat(raw)
-          elif os.environ["GITHUB_EVENT_NAME"] == "schedule":
+          requested_hour = os.environ.get("REQUESTED_HOUR")
+          if os.environ["GITHUB_EVENT_NAME"] == "schedule":
               api, repo, run_id = (os.environ[key] for key in ("GITHUB_API_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID"))
               req = urllib.request.Request(f"{api}/repos/{repo}/actions/runs/{run_id}",
                                            headers={"Authorization": "Bearer " + os.environ["ACTIONS_TOKEN"]})
               with urllib.request.urlopen(req, timeout=20) as response:
                   created = datetime.datetime.fromisoformat(json.load(response)["created_at"]).astimezone(taipei)
-              date = created.date() - datetime.timedelta(days=created.time() < datetime.time(20, 17))
+              utc = created.astimezone(datetime.timezone.utc)
+              scheduled_hour = int(os.environ["SCHEDULE_CRON"].split()[1])
+              slot = utc.replace(hour=scheduled_hour, minute=17, second=0, microsecond=0)
+              if slot > utc:
+                  slot -= datetime.timedelta(days=1)
+              reference = slot.astimezone(taipei)
           else:
-              date = datetime.datetime.now(taipei).date()
+              reference = datetime.datetime.now(taipei)
+          reference -= datetime.timedelta(minutes=17)
+          date = datetime.date.fromisoformat(raw) if raw else reference.date()
+          if requested_hour and requested_hour not in {"00", "04", "08", "12", "16", "20"}:
+              raise SystemExit("Invalid Taipei episode hour.")
+          hour = requested_hour or f"{reference.hour // 4 * 4:02d}"
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"date={date.isoformat()}", file=output)
+              print(f"hour={hour}", file=output)
           PYTHON
       - name: Restore the original bilingual script for retries
         id: script
@@ -66,7 +85,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: episode.json
-          key: science-scene-v2-${{ steps.episode.outputs.date }}
+          key: science-scene-v3-${{ steps.episode.outputs.date }}-${{ steps.episode.outputs.hour }}
       - name: Install video dependencies
         run: |
           sudo apt-get update
@@ -84,6 +103,7 @@ jobs:
           EPISODE_TOPIC: ${{ inputs.upload != true && inputs.topic || 'auto' }}
           UPLOAD: ${{ github.event_name == 'schedule' || inputs.upload == true }}
           EPISODE_DATE: ${{ steps.episode.outputs.date }}
+          EPISODE_HOUR: ${{ steps.episode.outputs.hour }}
         run: |
           cat > channel.py <<'PYTHON_SOURCE'
           import argparse
@@ -269,7 +289,7 @@ jobs:
               chosen = dict.fromkeys(LANGUAGES, baseline)
               markers = {}
               for marker, video_id in seen.items():
-                  match = re.fullmatch(r"Science Notes / (\d{4}-\d{2}-\d{2}) / (zh-TW|en)", marker)
+                  match = re.fullmatch(r"Science Notes / (\d{4}-\d{2}-\d{2}) / (?:(?:00|04|08|12|16|20) / )?(zh-TW|en)", marker)
                   if match and 2 <= (day - dt.date.fromisoformat(match[1])).days <= 60:
                       markers[video_id] = match[2]
               if not markers:
@@ -683,7 +703,8 @@ jobs:
               parser.add_argument("--date", type=dt.date.fromisoformat)
               args = parser.parse_args()
               day = args.date or dt.datetime.now(ZoneInfo("Asia/Taipei")).date()
-              marker = f"Science Notes / {day.isoformat()}"
+              hour = os.environ["EPISODE_HOUR"]
+              marker = f"Science Notes / {day.isoformat()} / {hour}"
               markers = {language: f"{marker} / {language}" for language in LANGUAGES}
               seen, history = {}, {}
               if args.upload or args.publish:
@@ -756,7 +777,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: episode.json
-          key: science-scene-v2-${{ steps.episode.outputs.date }}
+          key: science-scene-v3-${{ steps.episode.outputs.date }}-${{ steps.episode.outputs.hour }}
       - name: Upload both language versions
         if: (github.event_name == 'schedule' || inputs.upload == true) && hashFiles('output/short-*.mp4') != ''
         env:
@@ -765,6 +786,7 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_CHANNEL_ID: ${{ vars.YT_CHANNEL_ID }}
           EPISODE_DATE: ${{ steps.episode.outputs.date }}
+          EPISODE_HOUR: ${{ steps.episode.outputs.hour }}
         run: .venv/bin/python channel.py --publish --date "$EPISODE_DATE"
       - name: Save rendered videos
         if: always()
