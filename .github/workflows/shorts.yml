@@ -169,7 +169,20 @@ jobs:
                   "refresh_token": os.environ["YT_REFRESH_TOKEN"],
                   "grant_type": "refresh_token",
               }).encode()
-              _, token = request("https://oauth2.googleapis.com/token", data=form)
+              try:
+                  _, token = request("https://oauth2.googleapis.com/token", data=form)
+              except urllib.error.HTTPError as error:
+                  try:
+                      details = json.load(error)
+                      reason = details.get("error") if isinstance(details, dict) else None
+                  except (ValueError, OSError):
+                      reason = None
+                  messages = {
+                      "invalid_grant": "YouTube authorization expired or was revoked. Reauthorize the channel and replace YT_REFRESH_TOKEN.",
+                      "invalid_client": "YouTube OAuth client rejected. Check YT_CLIENT_ID and YT_CLIENT_SECRET.",
+                  }
+                  message = messages.get(reason) if isinstance(reason, str) else None
+                  raise SystemExit(message or f"YouTube token refresh failed (HTTP {error.code}). Check Google OAuth settings.") from None
               headers = {"Authorization": "Bearer " + token["access_token"]}
               _, channels = request(f"{API}/channels?part=contentDetails&mine=true", headers=headers)
               expected = os.environ["YT_CHANNEL_ID"]
